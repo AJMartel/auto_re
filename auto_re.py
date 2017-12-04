@@ -3,31 +3,28 @@ __author__ = 'Trafimchuk Aliaksandr'
 
 from collections import defaultdict
 import idaapi
-from idautils import FuncItems
-from idaapi import o_reg, o_imm, o_far, o_near, o_mem
+from idautils import FuncItems, CodeRefsTo
+from idaapi import o_reg, o_imm, o_far, o_near, o_mem, o_displ
+import os
+import sys
 import traceback
 
 
-# HAS_PYSIDE = False
-# try:
-#     from PySide import QtGui, QtCore
-#     from PySide.QtGui import QTreeView, QVBoxLayout, QLineEdit
-#
-#     _slot = QtCore.Slot
-#     global HAS_PYSIDE
-#     HAS_PYSIDE = True
-# except ImportError:
-#     from PyQt5 import QtGui, QtCore
-#     from PyQt5.QtWidgets import QTreeView, QVBoxLayout, QLineEdit
-#
-#     # dummy
-#     def _slot(fn):
-#         def wrap(*args, **kwargs):
-#             return fn(*args, **kwargs)
-#         return wrap
+HAS_PYSIDE = idaapi.IDA_SDK_VERSION < 690
+if HAS_PYSIDE:
+    from PySide import QtGui, QtCore
+    from PySide.QtGui import QTreeView, QVBoxLayout, QLineEdit
+else:
+    from PyQt5 import QtGui, QtCore
+    from PyQt5.QtWidgets import QTreeView, QVBoxLayout, QLineEdit
 
-from PyQt5 import QtGui, QtCore
-from PyQt5.QtWidgets import QTreeView, QVBoxLayout, QLineEdit
+
+# enable to allow PyCharm remote debug
+RDEBUG = False
+# adjust this value to be a full path to a debug egg
+RDEBUG_EGG = r'c:\Program Files\JetBrains\PyCharm 2017.1.4\debug-eggs\pycharm-debug.egg'
+RDEBUG_HOST = 'localhost'
+RDEBUG_PORT = 12321
 
 
 TAGS_IGNORE_LIST = {
@@ -49,19 +46,23 @@ TAGS = {
             'InternetOpenUrl', 'InternetQueryOption', 'InternetSetOption', 'InternetReadFile', 'InternetWriteFile',
             'InternetGetConnectedState', 'InternetSetStatusCallback', 'DnsQuery', 'getaddrinfo', 'GetAddrInfo',
             'GetAdaptersInfo', 'GetAdaptersAddresses', 'HttpQueryInfo', 'ObtainUserAgentString', 'WNetGetProviderName',
-            'GetBestInterfaceEx', 'gethostbyname', 'getsockname', 'connect'],
+            'GetBestInterfaceEx', 'gethostbyname', 'getsockname', 'connect', 'WinHttpOpen', 'WinHttpSetTimeouts',
+            'WinHttpSendRequest', 'WinHttpConnect', 'WinHttpCrackUrl', 'WinHttpReadData', 'WinHttpOpenRequest',
+            'WinHttpReceiveResponse', 'WinHttpQueryHeaders'],
     'spawn': ['CreateProcess', 'ShellExecute', 'ShellExecuteEx', 'system', 'CreateProcessInternal', 'NtCreateProcess',
               'ZwCreateProcess', 'NtCreateProcessEx', 'ZwCreateProcessEx', 'NtCreateUserProcess', 'ZwCreateUserProcess',
               'RtlCreateUserProcess', 'NtCreateSection', 'ZwCreateSection', 'NtOpenSection', 'ZwOpenSection',
               'NtAllocateVirtualMemory', 'ZwAllocateVirtualMemory', 'NtWriteVirtualMemory', 'ZwWriteVirtualMemory',
               'NtMapViewOfSection', 'ZwMapViewOfSection', 'OpenSCManager', 'CreateService', 'OpenService',
-              'StartService', 'ControlService'],
-    'inject': ['OpenProcess-disabled', 'ZwOpenProcess', 'WriteProcessMemory', 'CreateRemoteThread', 'QueueUserAPC'],
+              'StartService', 'ControlService', 'ShellExecuteExA', 'ShellExecuteExW'],
+    'inject': ['OpenProcess-disabled', 'ZwOpenProcess', 'NtOpenProcess', 'WriteProcessMemory', 'NtWriteVirtualMemory',
+               'ZwWriteVirtualMemory', 'CreateRemoteThread', 'QueueUserAPC', 'ZwUnmapViewOfSection', 'NtUnmapViewOfSection'],
     'com': ['CoCreateInstance', 'CoInitializeSecurity', 'CoGetClassObject', 'OleConvertOLESTREAMToIStorage'],
     'crypto': ['CryptAcquireContext', 'CryptProtectData', 'CryptUnprotectData', 'CryptProtectMemory',
                'CryptUnprotectMemory', 'CryptDecrypt', 'CryptEncrypt', 'CryptHashData', 'CryptDecodeMessage',
                'CryptDecryptMessage', 'CryptEncryptMessage', 'CryptHashMessage', 'CryptExportKey', 'CryptGenKey',
-               'CryptCreateHash', 'CryptDecodeObjectEx', 'EncryptMessage', 'DecryptMessage']
+               'CryptCreateHash', 'CryptDecodeObjectEx', 'EncryptMessage', 'DecryptMessage'],
+    'kbd': ['SendInput', 'VkKeyScanA', 'VkKeyScanW']
 }
 
 blacklist = {'@__security_check_cookie@4', '__SEH_prolog4', '__SEH_epilog4'}
@@ -75,21 +76,33 @@ def get_addr_width():
     return '16' if idaapi.cvar.inf.is_64bit() else '8'
 
 
+def decode_insn(ea):
+    if idaapi.IDA_SDK_VERSION >= 700 and sys.maxsize > 2**32:
+        insn = idaapi.insn_t()
+        if idaapi.decode_insn(insn, ea) > 0:
+            return insn
+    else:
+        if idaapi.decode_insn(ea):
+            return idaapi.cmd.copy()
+
+
 class AutoREView(idaapi.PluginForm):
     ADDR_ROLE = QtCore.Qt.UserRole + 1
 
     def __init__(self, data):
         super(AutoREView, self).__init__()
         self._data = data
+        self.tv = None
+        self._model = None
 
     def Show(self):
         return idaapi.PluginForm.Show(self, 'AutoRE', options=idaapi.PluginForm.FORM_PERSIST)
 
     def OnCreate(self, form):
-        # if HAS_PYSIDE:
-        #     self.parent = self.FormToPySideWidget(form)
-        # else:
-        self.parent = self.FormToPyQtWidget(form)
+        if HAS_PYSIDE:
+            self.parent = self.FormToPySideWidget(form)
+        else:
+            self.parent = self.FormToPyQtWidget(form)
 
         self.tv = QTreeView()
         self.tv.setExpandsOnDoubleClick(False)
@@ -116,7 +129,6 @@ class AutoREView(idaapi.PluginForm):
         # self.le_filter.textChanged.connect(self.on_filter_text_changed)
 
     def OnClose(self, form):
-        # print 'TODO: OnClose(): clear the pointer to form in the plugin'
         pass
 
     def _tv_init_header(self, model):
@@ -130,6 +142,7 @@ class AutoREView(idaapi.PluginForm):
         item_header = QtGui.QStandardItem("API called")
         model.setHorizontalHeaderItem(2, item_header)
 
+    # noinspection PyMethodMayBeStatic
     def _tv_make_tag_item(self, name):
         rv = QtGui.QStandardItem(name)
 
@@ -190,6 +203,18 @@ class auto_re_t(idaapi.plugin_t):
     _PREFIX_NAME = 'au_re_'
     _MIN_MAX_MATH_OPS_TO_ALLOW_RENAME = 10
 
+    _CALLEE_NODE_NAMES = {
+        idaapi.PLFM_MIPS: '$ mips',
+        idaapi.PLFM_ARM: '$ arm'
+    }
+    _DEFAULT_CALLEE_NODE_NAME = '$ vmm functions'
+
+    _JMP_TYPES = {idaapi.NN_jmp, idaapi.NN_jmpni, idaapi.NN_jmpfi, idaapi.NN_jmpshort}
+
+    def __init__(self):
+        super(auto_re_t, self).__init__()
+        self._data = None
+
     def init(self):
         # self._cfg = None
         self.view = None
@@ -203,7 +228,15 @@ class auto_re_t(idaapi.plugin_t):
     # def _store_config(self, cfg):
     #     pass
 
-    def _handle_tags(self, fn, fn_an):
+    def _handle_tags(self, fn, fn_an, known_refs):
+        if known_refs:
+            known_refs = dict(known_refs)
+            for k, names in known_refs.items():
+                existing = set(fn_an['tags'][k])
+                new = set(names) - existing
+                if new:
+                    fn_an['tags'][k] += list(new)
+
         tags = dict(fn_an['tags'])
         if not tags:
             return
@@ -238,6 +271,10 @@ class auto_re_t(idaapi.plugin_t):
         if idaapi.has_dummy_name(idaapi.getFlags(ea)):
             return
 
+        # TODO: check is there jmp, push+retn then don't rename the func
+        if fn_an['strange_flow']:
+            return
+
         possible_name = idaapi.get_ea_name(ea)
         if not possible_name or possible_name in blacklist:
             return
@@ -252,10 +289,97 @@ class auto_re_t(idaapi.plugin_t):
             fn.startEA, len(fn_an['calls']), len(fn_an['math']), 'has bads' if fn_an['has_bads'] else '',
             possible_name, normalized)
 
+    # noinspection PyMethodMayBeStatic
+    def _check_is_jmp_wrapper(self, dis):
+        # checks instructions like `jmp API`
+        if dis.itype not in self._JMP_TYPES:
+            return
+
+        # handle call wrappers like jmp GetProcAddress
+        if dis.Op1.type == idaapi.o_mem and dis.Op1.addr:
+            # TODO: check is there better way to determine is the function a wrapper
+            v = dis.Op1.addr
+            return v
+
+    # noinspection PyMethodMayBeStatic
+    def _check_is_push_retn_wrapper(self, dis0, dis1):
+        """
+        Checks for sequence of push IMM32/retn
+        :param dis0: the first insn
+        :param dis1: the second insn
+        :return: value of IMM32
+        """
+        if dis0.itype != idaapi.NN_push or dis0.Op1.type != idaapi.o_imm or not dis0.Op1.value:
+            return
+
+        if dis1.itype not in (idaapi.NN_retn,):
+            return
+
+        return dis0.Op1.value
+
+    def _preprocess_api_wrappers(self, fnqty):
+        rv = defaultdict(dict)
+
+        for i in xrange(fnqty):
+            fn = idaapi.getn_func(i)
+            items = list(FuncItems(fn.startEA))
+            if len(items) not in (1, 2):
+                continue
+
+            dis0 = decode_insn(items[0])
+            if dis0 is None:
+                continue
+            addr = self._check_is_jmp_wrapper(dis0)
+
+            if not addr and len(items) > 1:
+                dis1 = decode_insn(items[1])
+                if dis1 is not None:
+                    addr = self._check_is_push_retn_wrapper(dis0, dis1)
+
+            if not addr:
+                continue
+
+            name = idaapi.get_ea_name(addr)
+            name = name.replace(idaapi.FUNC_IMPORT_PREFIX, '')
+            if not name:
+                continue
+
+            for tag, names in TAGS.items():
+                for tag_api in names:
+                    if tag_api in name:
+                        refs = list(CodeRefsTo(fn.startEA, 1))
+
+                        for ref in refs:
+                            ref_fn = idaapi.get_func(ref)
+                            if not ref_fn:
+                                # idaapi.msg('AutoRE: there is no func for ref: %08x for api: %s' % (ref, name))
+                                continue
+                            if tag not in rv[ref_fn.startEA]:
+                                rv[ref_fn.startEA][tag] = list()
+                            if name not in rv[ref_fn.startEA][tag]:
+                                rv[ref_fn.startEA][tag].append(name)
+        return dict(rv)
+
     def run(self, arg):
+        if RDEBUG and RDEBUG_EGG:
+            if not os.path.isfile(RDEBUG_EGG):
+                idaapi.msg('AutoRE: Remote debug is enabled, but I cannot find the debug egg: %s' % RDEBUG_EGG)
+            else:
+                import sys
+
+                if RDEBUG_EGG not in sys.path:
+                    sys.path.append(RDEBUG_EGG)
+
+                import pydevd
+                pydevd.settrace(RDEBUG_HOST, port=RDEBUG_PORT, stdoutToServer=True, stderrToServer=True)  # , stdoutToServer=True, stderrToServer=True
+
         try:
             self._data = dict()
             count = idaapi.get_func_qty()
+
+            # pre-process of api wrapper functions
+            known_refs_tags = self._preprocess_api_wrappers(count)
+
             for i in xrange(count):
                 fn = idaapi.getn_func(i)
                 fn_an = self.analyze_func(fn)
@@ -266,7 +390,8 @@ class auto_re_t(idaapi.plugin_t):
                 if idaapi.has_dummy_name(idaapi.getFlags(fn.startEA)):
                     self._handle_calls(fn, fn_an)
 
-                self._handle_tags(fn, fn_an)
+                known_refs = known_refs_tags.get(fn.startEA)
+                self._handle_tags(fn, fn_an, known_refs)
 
             if self.view:
                 self.view.Close(idaapi.PluginForm.FORM_NO_CONTEXT)
@@ -276,7 +401,7 @@ class auto_re_t(idaapi.plugin_t):
             idaapi.msg('AutoRE: error: %s\n' % traceback.format_exc())
 
     def term(self):
-        pass
+        self._data = None
 
     @classmethod
     def disasm_func(cls, fn):
@@ -284,18 +409,38 @@ class auto_re_t(idaapi.plugin_t):
         items = list(FuncItems(fn.startEA))
         for item_ea in items:
             obj = {'ea': item_ea, 'fn_ea': fn.startEA, 'dis': None}
-            if idaapi.decode_insn(item_ea) > 0:
-                obj['dis'] = idaapi.cmd.copy()
+            insn = decode_insn(item_ea)
+            if insn is not None:
+                obj['dis'] = insn
             rv.append(obj)
         return rv
+
+    @classmethod
+    def get_callee_netnode(cls):
+        node_name = cls._CALLEE_NODE_NAMES.get(idaapi.ph.id, cls._DEFAULT_CALLEE_NODE_NAME)
+        n = idaapi.netnode(node_name)
+        return n
+
+    @classmethod
+    def get_callee(cls, ea):
+        n = cls.get_callee_netnode()
+        v = n.altval(ea)
+        v -= 1
+        if v == idaapi.BADNODE:
+            return
+        return v
 
     @classmethod
     def _analysis_handle_call_insn(cls, dis, rv):
         rv['calls'].append(dis)
         if dis.Op1.type != o_mem or not dis.Op1.addr:
-            return
+            callee = cls.get_callee(dis.ip)
+            if not callee:
+                return
+        else:
+            callee = dis.Op1.addr
 
-        name = idaapi.get_ea_name(dis.Op1.addr)
+        name = idaapi.get_ea_name(callee)
         name = name.replace(idaapi.FUNC_IMPORT_PREFIX, '')
 
         if '@' in name:
@@ -308,20 +453,28 @@ class auto_re_t(idaapi.plugin_t):
             rv['calls'].pop()
             return
 
-        for tag, names in TAGS.items():
-            if name in TAGS_IGNORE_LIST:
-                continue
+        if name in TAGS_IGNORE_LIST:
+            return
 
+        for tag, names in TAGS.items():
             for tag_api in names:
-                if tag_api in name:
+                if tag_api in name and name not in rv['tags'][tag]:
                     # print '%#08x: %s, tag: %s' % (dis.ea, name, tag)
                     rv['tags'][tag].append(name)
                     break
 
     @classmethod
     def analyze_func(cls, fn):
-        rv = {'fn': fn, 'calls': [], 'math': [], 'has_bads': False, 'tags': defaultdict(list)}
+        rv = {
+            'fn': fn,
+            'calls': [],
+            'math': [],
+            'has_bads': False,
+            'strange_flow': False,
+            'tags': defaultdict(list)
+        }
         items = cls.disasm_func(fn)
+        items_set = set(map(lambda x: x['ea'], items))
 
         for item in items:
             dis = item['dis']
@@ -339,6 +492,19 @@ class auto_re_t(idaapi.plugin_t):
                                idaapi.NN_rol, idaapi.NN_rcl, idaapi.NN_rcl):
                 # TODO
                 rv['math'].append(dis)
+            elif dis.itype in cls._JMP_TYPES:
+                if dis.Op1.type not in (o_far, o_near, o_mem, o_displ):
+                    continue
+
+                if dis.Op1.type == o_displ:
+                    rv['strange_flow'] = True
+                    continue
+
+                ea = dis.Op1.value
+                if not ea and dis.Op1.addr:
+                    ea = dis.Op1.addr
+                if ea not in items_set:
+                    rv['strange_flow'] = True
 
         return rv
 
@@ -365,5 +531,6 @@ class auto_re_t(idaapi.plugin_t):
     #     curloc.mark(slot[0], name, name)
 
 
+# noinspection PyPep8Naming
 def PLUGIN_ENTRY():
     return auto_re_t()
